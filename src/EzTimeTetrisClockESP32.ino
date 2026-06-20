@@ -7,11 +7,14 @@
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
+#include <WiFiClientSecure.h>
 #include <ESPmDNS.h>
 #include <ESPAsyncWebServer.h>
 #include <ESP32-HUB75-MatrixPanel-I2S-DMA.h>
 #include <TetrisMatrixDraw.h>
 #include <ezTime.h>
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
 
 // --- Configuration Constants ---
 const char* ssid = "wifi";
@@ -20,17 +23,24 @@ const char* password = "8111874110";
 // --- Global Settings (Configurable via Web UI) ---
 String timeZoneStr = "Asia/Kolkata";
 bool twelveHourFormat = true;
-int matrixBrightness = 90;
+int matrixBrightness = 40; // Lowered from 90 to prevent power spikes
 int scrollSpeedMs = 40;
+
+// --- Night Mode Variables ---
+String nightStart = "22:00";
+String nightEnd = "06:00";
+int nightBrightness = 10;
+bool isNightMode = false;
 
 String apiKey = "0196388992da70b59107c8ddaa24a7e4";
 String cityId = "1263280"; 
 String globalBottomText = "Hello World!";
 
-// --- Quran API Variables ---
-bool quranMode = false;
-unsigned long lastQuranUpdate = 0;
-bool forceQuranUpdate = false;
+// --- Quotes API Variables ---
+bool quoteMode = false;
+unsigned long lastQuoteUpdate = 0;
+bool forceQuoteUpdate = false;
+String quoteApiKey = ""; 
 
 // --- Matrix & Display Variables ---
 MatrixPanel_I2S_DMA *display = nullptr;
@@ -93,15 +103,27 @@ const char index_html[] = R"rawliteral(
 <body>
   <div class="container">
     <h2>Clock Control Panel</h2>
-    <form action="/update" method="POST">
+    <form id="configForm" action="/update" method="POST">
       
       <fieldset>
         <legend>Display Settings</legend>
-        <label>Brightness: <span class="val-display" id="briVal">%BRIGHTNESS%</span></label>
-        <input type="range" name="brightness" min="0" max="255" value="%BRIGHTNESS%" oninput="document.getElementById('briVal').innerText = this.value">
+        <label>Brightness (Max 150): <span class="val-display" id="briVal">%BRIGHTNESS%</span></label>
+        <input type="range" name="brightness" min="0" max="150" value="%BRIGHTNESS%" oninput="document.getElementById('briVal').innerText = this.value">
         
         <label>Scroll Speed (ms/pixel): <span class="val-display" id="spdVal">%SCROLL_SPEED%</span></label>
         <input type="range" name="scrollSpeed" min="10" max="150" value="%SCROLL_SPEED%" oninput="document.getElementById('spdVal').innerText = this.value">
+      </fieldset>
+
+      <fieldset>
+        <legend>Night Mode</legend>
+        <label>Start Time (HH:MM):</label>
+        <input type="time" name="nightStart" value="%NIGHT_START%">
+        
+        <label>End Time (HH:MM):</label>
+        <input type="time" name="nightEnd" value="%NIGHT_END%">
+        
+        <label>Night Brightness: <span class="val-display" id="nbriVal">%NIGHT_BRIGHTNESS%</span></label>
+        <input type="range" name="nightBrightness" min="0" max="150" value="%NIGHT_BRIGHTNESS%" oninput="document.getElementById('nbriVal').innerText = this.value">
       </fieldset>
 
       <fieldset>
@@ -121,11 +143,17 @@ const char index_html[] = R"rawliteral(
         <label>Scroll Text Mode:</label>
         <select name="scrollMode">
           <option value="custom" %CUSTOM_SEL%>Custom Text</option>
-          <option value="quran" %QURAN_SEL%>Random Quran Verse (API)</option>
+          <option value="quote" %QUOTE_SEL%>Random Quote (API)</option>
         </select>
 
         <label>Custom Message:</label>
         <input type="text" name="scrollMsg" value="%SCROLL_MSG%">
+      </fieldset>
+
+      <fieldset>
+        <legend>Quotes Config (API-Ninjas)</legend>
+        <label>API Key:</label>
+        <input type="text" name="quoteApiKey" value="%QUOTE_API_KEY%">
       </fieldset>
 
       <fieldset>
@@ -137,9 +165,31 @@ const char index_html[] = R"rawliteral(
         <input type="text" name="cityId" value="%CITY_ID%">
       </fieldset>
 
-      <input type="submit" value="Update & Apply Settings">
     </form>
   </div>
+  <script>
+    let timeout = null;
+    function saveSettings() {
+      clearTimeout(timeout);
+      timeout = setTimeout(() => {
+        fetch('/update', {
+          method: 'POST',
+          body: new URLSearchParams(new FormData(document.getElementById('configForm')))
+        }).catch(console.error);
+      }, 300);
+    }
+    
+    window.onload = () => {
+      const inputs = document.querySelectorAll('#configForm input, #configForm select');
+      inputs.forEach(input => {
+        if(input.type === 'range') {
+          input.addEventListener('input', saveSettings);
+        } else {
+          input.addEventListener('change', saveSettings);
+        }
+      });
+    }
+  </script>
 </body>
 </html>
 )rawliteral";
@@ -150,13 +200,17 @@ String buildHTML() {
   html.replace("%SCROLL_MSG%", globalBottomText);
   html.replace("%API_KEY%", apiKey);
   html.replace("%CITY_ID%", cityId);
-  html.replace("%CUSTOM_SEL%", quranMode ? "" : "selected");
-  html.replace("%QURAN_SEL%", quranMode ? "selected" : "");
+  html.replace("%CUSTOM_SEL%", quoteMode ? "" : "selected");
+  html.replace("%QUOTE_SEL%", quoteMode ? "selected" : "");
+  html.replace("%QUOTE_API_KEY%", quoteApiKey);
   html.replace("%TIMEZONE%", timeZoneStr);
   html.replace("%FMT_12%", twelveHourFormat ? "selected" : "");
   html.replace("%FMT_24%", twelveHourFormat ? "" : "selected");
   html.replace("%BRIGHTNESS%", String(matrixBrightness));
   html.replace("%SCROLL_SPEED%", String(scrollSpeedMs));
+  html.replace("%NIGHT_START%", nightStart);
+  html.replace("%NIGHT_END%", nightEnd);
+  html.replace("%NIGHT_BRIGHTNESS%", String(nightBrightness));
   return html;
 }
 
@@ -179,17 +233,18 @@ void setupWebServer() {
   server.on("/update", HTTP_POST, [](AsyncWebServerRequest *request){
     if (request->hasParam("scrollMode", true)) {
       String mode = request->getParam("scrollMode", true)->value();
-      if (mode == "quran") {
-        quranMode = true;
-        forceQuranUpdate = true;
+      if (mode == "quote") {
+        quoteMode = true;
+        forceQuoteUpdate = true;
       } else {
-        quranMode = false;
+        quoteMode = false;
       }
     }
-    if (request->hasParam("scrollMsg", true) && !quranMode) {
+    if (request->hasParam("scrollMsg", true) && !quoteMode) {
       globalBottomText = request->getParam("scrollMsg", true)->value();
       scrollX = 64; 
     }
+    if (request->hasParam("quoteApiKey", true)) quoteApiKey = request->getParam("quoteApiKey", true)->value();
     if (request->hasParam("apiKey", true)) apiKey = request->getParam("apiKey", true)->value();
     if (request->hasParam("cityId", true)) {
       cityId = request->getParam("cityId", true)->value();
@@ -208,12 +263,19 @@ void setupWebServer() {
     }
     if (request->hasParam("brightness", true)) {
       matrixBrightness = request->getParam("brightness", true)->value().toInt();
-      if(display) display->setBrightness8(matrixBrightness);
+      if (matrixBrightness > 150) matrixBrightness = 150;
+      if(display && !isNightMode) display->setBrightness8(matrixBrightness);
+    }
+    if (request->hasParam("nightStart", true)) nightStart = request->getParam("nightStart", true)->value();
+    if (request->hasParam("nightEnd", true)) nightEnd = request->getParam("nightEnd", true)->value();
+    if (request->hasParam("nightBrightness", true)) {
+      nightBrightness = request->getParam("nightBrightness", true)->value().toInt();
+      if(display && isNightMode) display->setBrightness8(nightBrightness);
     }
     if (request->hasParam("scrollSpeed", true)) {
       scrollSpeedMs = request->getParam("scrollSpeed", true)->value().toInt();
     }
-    request->send(200, "text/html", "<body style='background:#121212; color:white; text-align:center; font-family:sans-serif; margin-top:50px;'><h2>Settings Applied Successfully!</h2><br><a href='/' style='color:#4CAF50; font-size: 1.2em;'>Go Back</a></body>");
+    request->send(200, "text/plain", "OK");
   });
 
   server.begin();
@@ -238,24 +300,27 @@ void updateWeather() {
   }
 }
 
-void updateQuranVerse() {
+void updateRandomQuote() {
   if (WiFi.status() == WL_CONNECTED) {
-    WiFiClient client;
+    WiFiClientSecure client;
+    client.setInsecure(); // Needed for HTTPS connections
     HTTPClient http;
-    String url = "http://api.alquran.cloud/v1/ayah/random/en.sahih";
+    String url = "https://motivational-spark-api.vercel.app/api/quotes/random"; 
     
     if (http.begin(client, url)) {
+      if (quoteApiKey.length() > 0) {
+        http.addHeader("X-Api-Key", quoteApiKey);
+      }
       if (http.GET() == HTTP_CODE_OK) {
         DynamicJsonDocument doc(3072); 
         if (!deserializeJson(doc, http.getString())) {
-          String text = doc["data"]["text"].as<String>();
-          String surah = doc["data"]["surah"]["englishName"].as<String>();
-          int number = doc["data"]["numberInSurah"].as<int>();
+          // Robust parsing to handle different JSON formats just in case
+          String text = doc["quote"].isNull() ? (doc[0]["quote"].isNull() ? doc["content"].as<String>() : doc[0]["quote"].as<String>()) : doc["quote"].as<String>();
           
           text.replace("\n", " ");
           text.replace("\r", "");
           
-          globalBottomText = surah + " " + String(number) + ": " + text;
+          globalBottomText = text; // Do not display author name per request
           scrollX = 64; 
         }
       }
@@ -298,7 +363,7 @@ void drawBottomScroll() {
     scrollX--;
     if (scrollX < -(int)(globalBottomText.length() * 6)) {
       scrollX = 64;
-      if (quranMode && (millis() - lastQuranUpdate > 10000)) forceQuranUpdate = true;
+      if (quoteMode && (millis() - lastQuoteUpdate > 10000)) forceQuoteUpdate = true;
     }
     lastScrollMove = millis();
   }
@@ -368,6 +433,7 @@ void drawIntroWord(const char* word, int x, int y) {
 // ==========================================
 
 void setup() {
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // Disable brownout detector to prevent voltage drop reboots
   Serial.begin(115200);
   
   WiFi.mode(WIFI_STA);
@@ -421,7 +487,7 @@ void setup() {
 
   updateWeather();
 
-  tetris->setText("PRO26", forceRefresh);
+ 
   
   xTaskCreatePinnedToCore(animationTask, "animTask", 8192, NULL, 2, &animationTaskHandle, 1);
 
@@ -442,10 +508,10 @@ void loop() {
     forceWeatherUpdate = false;
   }
 
-  if (quranMode && forceQuranUpdate) {
-    updateQuranVerse();
-    lastQuranUpdate = now;
-    forceQuranUpdate = false;
+  if (quoteMode && forceQuoteUpdate) {
+    updateRandomQuote();
+    lastQuoteUpdate = now;
+    forceQuoteUpdate = false;
   }
 
   if (now - lastTopCycle > 5000) {
@@ -457,10 +523,28 @@ void loop() {
     if (weatherTemp == 0 && weatherHumidity == 0) globalTopText = "Loading...";
     else { char buf[16]; sprintf(buf, "%.0fC %d%%", weatherTemp, weatherHumidity); globalTopText = String(buf); }
   } 
-  else if (topCycleMode == 1) globalTopText = myTZ.dateTime("d M yy");
+  else if (topCycleMode == 1) globalTopText = myTZ.dateTime("d-M-Y");
   else globalTopText = myTZ.dateTime("l");
 
   if (now > oneSecondLoopDue) {
+    if (timeStatus() == timeSet) {
+      int currentMins = myTZ.hour() * 60 + myTZ.minute();
+      int startMins = nightStart.substring(0, 2).toInt() * 60 + nightStart.substring(3).toInt();
+      int endMins = nightEnd.substring(0, 2).toInt() * 60 + nightEnd.substring(3).toInt();
+      
+      bool shouldBeNight = false;
+      if (startMins < endMins) {
+        shouldBeNight = (currentMins >= startMins && currentMins < endMins);
+      } else {
+        shouldBeNight = (currentMins >= startMins || currentMins < endMins);
+      }
+      
+      if (shouldBeNight != isNightMode) {
+        isNightMode = shouldBeNight;
+        display->setBrightness8(isNightMode ? nightBrightness : matrixBrightness);
+      }
+    }
+
     setMatrixTime();
     showColon = !showColon;
     if (finishedAnimating) {
